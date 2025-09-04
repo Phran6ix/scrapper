@@ -1,24 +1,29 @@
 use core::fmt;
+use http::StatusCode;
 use reqwest::{blocking::Client, header::ACCEPT};
-use std::clone;
-use std::sync::mpsc::RecvError;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{collections::HashMap, io, sync::mpsc};
 
-use crate::coordinator::queue;
-use crate::http_client;
-
-struct ResponseData {
-    status_code: u16,
-    html: String,
-    headers: HashMap<String, String>,
+#[derive(Debug)]
+pub struct ResponseData {
+    pub url: String,
+    pub status_code: u16,
+    pub html: Option<String>,
+    pub headers: HashMap<String, String>,
 }
 
 impl ResponseData {
-    fn new(status_code: u16, html: String, headers: HashMap<String, String>) -> Self {
+    fn new(
+        url: String,
+        status_code: u16,
+        html: Option<String>,
+        headers: HashMap<String, String>,
+    ) -> Self {
         Self {
+            url,
             status_code,
             html,
             headers,
@@ -36,7 +41,7 @@ impl fmt::Display for ResponseData {
     }
 }
 
-fn send_request(client: MutexGuard<'_, Client>, url: &str) -> Result<ResponseData, io::Error> {
+fn send_request(client: Client, url: &str) -> Result<ResponseData, io::Error> {
     let response = match client
         .get(url)
         .header(ACCEPT, "text/html")
@@ -44,7 +49,22 @@ fn send_request(client: MutexGuard<'_, Client>, url: &str) -> Result<ResponseDat
         .send()
     {
         Ok(res) => res,
-        Err(e) => panic!("An error occured while sending request {e}"),
+        // Err(e) => panic!("An error occured while sending request {e}"),
+        Err(e) => {
+            let status_code: u16 = match e.status() {
+                Some(status) => status.as_u16(),
+                None => StatusCode::BAD_GATEWAY.as_u16(),
+            };
+            eprintln!("STATUS CODE = $ {}", status_code);
+            eprintln!("An error occured while sending request {e}");
+
+            return Ok(ResponseData::new(
+                url.to_string(),
+                status_code,
+                None,
+                HashMap::new(),
+            ));
+        }
     };
 
     let status_code = response.status();
@@ -60,44 +80,80 @@ fn send_request(client: MutexGuard<'_, Client>, url: &str) -> Result<ResponseDat
 
     let html = response.text().expect("Error occured while parsing text");
 
-    let response_data = ResponseData::new(status_code.as_u16(), html.to_string(), headers);
+    let response_data = ResponseData::new(
+        url.to_string(),
+        status_code.as_u16(),
+        Some(html.to_string()),
+        headers,
+    );
 
+    // parser::parse_html::parse_html(&response_data)?;
     Ok(response_data)
 }
 
 pub fn process_queue_request(
     queue_rx: mpsc::Receiver<Vec<String>>,
     queue_handles: Vec<JoinHandle<()>>,
-) {
-    let url_semaphores: Arc<Mutex<HashMap<&str, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+) -> Result<(Receiver<ResponseData>, Vec<JoinHandle<()>>), io::Error> {
+    let max: usize = 4;
+    let url_semaphores: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     let client: Arc<Mutex<Client>> = Arc::new(Mutex::new(Client::new()));
-    while let Ok(urls) = queue_rx.recv() {
-        // match Ok(task) {
-        let client = Arc::clone(&client);
 
+    let retry_queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let bound: usize = 50;
+    let (result_tx, result_rx) = mpsc::sync_channel::<ResponseData>(bound);
+
+    while let Ok(urls) = queue_rx.recv() {
+        let client = Arc::clone(&client);
+        let semaphore = Arc::clone(&url_semaphores);
+        let retry_queue = Arc::clone(&retry_queue);
+
+        let result_tx = result_tx.clone();
         let handle = thread::spawn(move || {
             for url in urls {
-                let http_client = client.lock().unwrap();
-                let response = send_request(http_client, &url).unwrap();
+                let lock_acqure = try_acquire_semaphore_lock(&semaphore, url.as_str(), max);
 
-                println!("This is the response => {:#} \n \n \n ", response);
+                if !lock_acqure {
+                    thread::sleep(Duration::from_millis(500));
+                    retry_queue.lock().unwrap().push(url);
+                    continue;
+                }
+                // Let us not hold on to a mutex lock during an IO session
+                let http_client = {
+                    let guard = client.lock().unwrap();
+                    guard.clone()
+                };
+
+                let response = send_request(http_client, &url);
+
+                match response {
+                    Ok(res) => {
+                        println!("Success - On to the request queue  \n \n ");
+                        match result_tx.send(res) {
+                            Ok(_) => {
+                                println!("DONE SENDING TO RESULT POOL");
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("An error occured when sending to result pool {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("REQUEST FAILED FOR URL = {} with err {}", url, e);
+                    }
+                }
+
+                release_semaphore_lock(&semaphore, url.as_str());
             }
 
             thread::sleep(Duration::from_millis(5000));
-
-            // println!(
-            //     "We are currently processing thread number and task is {:?}",
-            //     urls
-            // );
         });
         handles.push(handle);
-        // }
-        // Err(e) => match e {
-        //     RecvError => println!("We are done sending to the http client"),
-        // },
     }
 
     for h in queue_handles {
@@ -105,8 +161,32 @@ pub fn process_queue_request(
         h.join().unwrap();
     }
 
-    for handle in handles {
-        handle.join().unwrap();
-    }
     println!("Okay we are done");
+    Ok((result_rx, handles))
+}
+
+fn try_acquire_semaphore_lock(
+    semaphore_map: &Arc<Mutex<HashMap<String, usize>>>,
+    url: &str,
+    max: usize,
+) -> bool {
+    let mut map = semaphore_map.lock().unwrap();
+    let current_count = map.entry(url.to_string()).or_insert(0);
+
+    if *current_count >= max {
+        false
+    } else {
+        *current_count += 1;
+        true
+    }
+}
+
+fn release_semaphore_lock(semaphore_map: &Arc<Mutex<HashMap<String, usize>>>, url: &str) {
+    let mut map = semaphore_map.lock().unwrap();
+    if let Some(c) = map.get_mut(url) {
+        *c -= 1;
+        if *c == 0 {
+            map.remove(url);
+        }
+    }
 }

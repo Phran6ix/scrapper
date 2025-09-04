@@ -1,9 +1,4 @@
-use std::{
-    io,
-    sync::{Arc, Mutex, mpsc::SyncSender},
-    thread,
-    time::Duration,
-};
+use std::{io, sync::mpsc::SyncSender, thread, time::Duration};
 
 use url::Url;
 
